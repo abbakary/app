@@ -203,6 +203,11 @@ async def initiate_payment(
     tenant_amount = request.amount - admin_fee
 
     # Create transaction record
+    # Merge order_reference into additional_data
+    additional_data = request.additional_data or {}
+    if request.order_reference:
+        additional_data["order_reference"] = request.order_reference
+
     transaction = models.ClickPesaTransaction(
         id=str(uuid.uuid4()),
         tenant_id=request.tenant_id,
@@ -216,7 +221,7 @@ async def initiate_payment(
         status="pending",
         payment_status="initiated",
         payout_status="pending",
-        additional_data=request.additional_data or {},
+        additional_data=additional_data,
     )
 
     db.add(transaction)
@@ -332,6 +337,52 @@ async def handle_clickpesa_webhook(
                 status="collected",
             )
             db.add(fee_log)
+
+            # Update associated Payment and Order records
+            order_id = None
+            if transaction.additional_data and isinstance(transaction.additional_data, dict):
+                order_id = transaction.additional_data.get("order_reference") or transaction.additional_data.get("order_id")
+
+            if order_id:
+                # Find and update the Payment record
+                payment = db.query(models.Payment).filter(
+                    models.Payment.order_id == order_id,
+                    models.Payment.restaurant_id == transaction.tenant_id
+                ).first()
+
+                if payment:
+                    payment.status = "SUCCESS"
+                    payment.webhook_processed = event_data["reference"]
+                    logger.info(f"Updated Payment {payment.id} to SUCCESS")
+
+                # Update Order status to paid
+                order = db.query(models.Order).filter(models.Order.id == order_id).first()
+                if order:
+                    order.status = "paid"
+                    order.paid_at = datetime.utcnow()
+
+                    # Free up table if dine-in
+                    if order.table_id:
+                        table = db.query(models.RestaurantTable).filter(
+                            models.RestaurantTable.id == order.table_id
+                        ).first()
+                        if table:
+                            table.status = "available"
+                            table.current_order_id = None
+
+                    logger.info(f"Updated Order {order_id} to paid status")
+
+                    # Create notification for payment received
+                    notification = models.Notification(
+                        id=str(uuid.uuid4()),
+                        restaurant_id=transaction.tenant_id,
+                        title="Payment Received",
+                        message=f"ClickPesa payment of {transaction.amount} received for order {order_id[:8]}",
+                        type="payment",
+                        read=False
+                    )
+                    db.add(notification)
+                    logger.info(f"Created notification for order {order_id}")
 
             logger.info(f"Payment received: {event_data['reference']}")
 
